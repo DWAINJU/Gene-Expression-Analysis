@@ -1,0 +1,171 @@
+#1.Download and Preprocess the Data set
+
+#Loading the necessary packages
+
+library(DESeq2)
+library(ggplot2)
+library(survival)
+library(dplyr)
+
+#Setting up the working directory
+path = "D:/Autum/Biomolecular/Final Assignment/Gene Expression Analysis"
+setwd(path)
+
+# Folder Untar
+
+folder_name = "brca_tcga_pan_can_atlas_2018.tar.gz"
+folder = paste(path, folder_name, sep = "/")
+untar(folder)
+
+#2.Read and Prepare the Data
+
+# Reading RNASeq file
+rna_seq_data  <- read.delim("data_mrna_seq_v2_rsem.txt")
+
+#Removing Duplicates
+keep = !duplicated(rna_seq_data[,1])
+rna_seq_data = rna_seq_data[keep,]
+
+# set rownames of rnaseq to hugo symbols
+rownames(rna_seq_data)<- rna_seq_data[,1]
+rna_seq_data  <- rna_seq_data[,-c(1,2)]
+
+# Reading Patient Data file
+patient_data <- read.delim("data_clinical_patient.txt")
+
+# Reading Copy Number Aberrations Data
+cna_data <- read.delim("data_cna.txt")
+cna_data <- cna_data|>
+  filter(Hugo_Symbol=="ERBB2")
+
+# 3.Match the RNASeq patient ids with the CNA ids and Patient Data ids
+
+# Matching patient IDs across data sets
+
+rna_seq_patient_id = gsub("\\.", "-",substr(colnames(rna_seq_data),1,12))
+
+cna_patient_id = gsub("\\.", "-",substr(colnames(cna_data[,-c(1,2)]),1,12))
+patient_id=patient_data[,1]
+common_ids <- Reduce(intersect, list(rna_seq_patient_id, cna_patient_id, patient_id))
+
+
+# Filtering Patient data with common patient id
+
+patient_data_filtered <- patient_data|>
+  filter(X.Patient.Identifier %in% common_ids)
+
+# Filtering CNA data with common patient id
+
+# Transpose cna_data to have samples as rows and genes as columns
+cna_data_transposed <- t(cna_data[,-1:-2])
+
+# Extracting patient IDs from the row names and replace "." with "-"
+cna_id <- gsub("\\.", "-", substr(rownames(cna_data_transposed), 1, 12))
+
+# Finding indices of common sample IDs
+common_indices <- cna_id %in% common_ids
+
+# Filter cna_data_transposed based on common sample IDs
+cna_data_filtered <- as.matrix(cna_data_transposed[common_indices, ])
+colnames(cna_data_filtered) = "CNA"
+
+
+# Filtering RNASEQ data with common patient id
+
+# Transpose rna_seq_data to have samples as rows and genes as columns
+rna_seq_transposed <- t(rna_seq_data)
+
+# Extracting patient IDs from the row names and replace "." with "-"
+rna_id <- gsub("\\.", "-", substr(rownames(rna_seq_transposed), 1, 12))
+
+# Finding indices of common sample IDs
+common_indices <- rna_id %in% common_ids
+
+
+# Filter rna_seq_transposed based on common sample IDs
+rna_data_filtered <- (rna_seq_transposed[common_indices, ])
+
+# Transpose back to have genes as rows and samples as columns
+rna_data_filtered <- t(rna_data_filtered)
+
+#Converting matrix elements to numeric
+rna_data_filtered<-apply(rna_data_filtered, c(1,2),as.numeric)
+
+# 4.Creating Metadata
+
+# Extract the row for ERBB2 excluding first two columns
+ERBB2_status = ifelse(cna_data_filtered[,"CNA"]>0, "Amplified", "Not Amplified")
+
+# Creating metadata
+metadata <- data.frame(as.factor(ERBB2_status))
+colnames(metadata) = 'ERBB2_status'
+
+metadata[is.na(metadata)] =0
+
+# 5.Data Normalization and Differential Expression using DESEQ2
+
+# DESeq2 DataSet Preparation
+dds <- DESeqDataSetFromMatrix(countData = round(rna_data_filtered), 
+                              colData = metadata, 
+                              design = ~ ERBB2_status)
+
+# Running the DESeq pipeline
+dds <- DESeq(dds)
+# storing the results in variable res
+res <- results(dds)
+
+# 6.Top 10 Differentially Expressed Genes Ranked by Fold Change
+
+# Calculating the absolute log fold change (FC) for each gene
+res$abs_log_fc <- abs(res$log2FoldChange)
+
+# Extract the top 10 DEGs
+top_10 <- res[order(res$abs_log_fc, decreasing=TRUE),][1:10,]
+
+# Removing log2FoldChange column
+top_10$log2FoldChange <- NULL
+
+# Renaming abs_log_fc column to log2FoldChange
+colnames(top_10)[which(colnames(top_10) == "abs_log_fc")] <- "absolutelog2FoldChange"
+
+# 7.Visualization of PCA
+#Creating a PCA plot for the normalized data.
+
+# Variance stabilizing transformation
+vst_data <- vst(dds, blind = FALSE)
+
+# PCA plot
+plotPCA(vst_data, intgroup = "ERBB2_status")+
+  theme_minimal()
+
+# Sample clustering
+# sampleDists <- dist(t(assay(vst_data)))
+# sampleDistMatrix <- as.matrix(sampleDists)
+# pheatmap(sampleDistMatrix)
+
+
+# 8.Pathway Enrichment Analysis
+#Loading clusterprofiler and org.Hs.eg.db to implement KEGG enrichment and Annotation data
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+degs <- rownames(res[which(res$padj < 0.05), ])  # adjust p-value threshold as needed
+
+# Converting gene symbols to Entrez IDs
+entrez_ids <- bitr(degs, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+entrez_ids <- na.omit(entrez_ids$ENTREZID)
+
+# Performing enrichment analysis (using KEGG)
+kegg_enrichment <- enrichKEGG(gene = entrez_ids, organism = 'hsa', pvalueCutoff = 0.05)
+
+# Plotting results
+barplot(kegg_enrichment, showCategory=20)+labs(
+  title = "Pathway Enrichment Analysis")+
+  theme(
+    plot.title = element_text(size=50,hjust = 0.5),
+    legend.title = element_text(size = 30),
+    legend.key.size = unit(1,"cm"),
+    legend.text = element_text(size = 20),
+    axis.title.x = element_text(size = 30),
+    axis.text.x = element_text(size = 20),
+    axis.text.y = element_text(size = 20))
